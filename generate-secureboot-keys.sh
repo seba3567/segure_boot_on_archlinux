@@ -2,6 +2,7 @@
 # secure-boot-manager.sh
 # Gestor minimalista y seguro para Secure Boot (generar claves, auto-firma, limpieza).
 # Hecho para UEFI + coexistencia con Windows e ISOs firmadas por Microsoft si sus certificados están presentes.
+# v5: Instala automáticamente secureboot-db para máxima compatibilidad y mejora la lógica de instalación.
 set -euo pipefail
 
 # ---- Configuración ----
@@ -12,14 +13,14 @@ PACMAN_HOOK_DIR="/etc/pacman.d/hooks"
 PACMAN_HOOK_FILE="$PACMAN_HOOK_DIR/99-secureboot-sign-kernel.hook"
 BACKUP_DIR="/var/lib/secureboot-manager/backup-$(date +%Y%m%d%H%M%S)"
 MS_KEYS_DIR_CANDIDATES=(
+  "/usr/share/secureboot/keys/microsoft" # Ruta que usa el paquete secureboot-db
   "/usr/share/efitools/keys"
   "/usr/share/secureboot/microsoft"
-  "/usr/share/secureboot/keys"
 )
 
-# Common Microsoft cert filenames (varies by distro/package)
-MS_KEK_CRT_NAMES=("MicrosoftKEKCA.crt" "Microsoft_production_CA_2011.crt" "Microsoft Corporation UEFI CA.crt")
-MS_DB_CRT_NAMES=("MicrosoftUEFICA.crt" "Microsoft Windows Production PCA 2011.crt" "Microsoft Corporation UEFI CA.crt")
+# Nombres de certificados de Microsoft
+MS_KEK_CRT_NAMES=("MicrosoftKEKCA.crt" "Microsoft Corporation KEK CA 2011.crt")
+MS_DB_CRT_NAMES=("MicrosoftUEFICA.crt" "Microsoft Windows Production PCA 2011.crt")
 
 # ---- Helpers ----
 log() { echo -e "[+] $*"; }
@@ -32,20 +33,18 @@ ensure_root() {
   fi
 }
 
-mkdirp_root() {
-  mkdir -p "$1"
-  chmod 755 "$1"
-}
+is_arch() { [[ -f /etc/arch-release ]]; }
+mkdirp_root() { mkdir -p "$1"; chmod 755 "$1"; }
 
 find_ms_cert() {
-  # busca un certificado microsoft (por lista de candidatos) y devuelve ruta o vacío
-  local candidate dir name
+  local cert_found=""
   for dir in "${MS_KEYS_DIR_CANDIDATES[@]}"; do
-    [[ -d "$dir" ]] || continue
+    if [[ ! -d "$dir" ]]; then continue; fi
+    # Busca tanto KEK como DB, devuelve el primero que encuentre
     for name in "${MS_KEK_CRT_NAMES[@]}" "${MS_DB_CRT_NAMES[@]}"; do
-      candidate="$dir/$name"
-      if [[ -f "$candidate" ]]; then
-        printf "%s\n" "$candidate"
+      if [[ -f "$dir/$name" ]]; then
+        cert_found="$dir/$name"
+        echo "$cert_found"
         return 0
       fi
     done
@@ -53,14 +52,12 @@ find_ms_cert() {
   return 1
 }
 
-# convierte y firma .esl -> .auth seguro con sign-efi-sig-list
 create_and_sign_esl_auth() {
-  # args: <cert.crt> <out_basename> <signer_key> <signer_cert> <signer_label>
   local cert="$1" outbase="$2" signer_key="$3" signer_cert="$4" signer_label="$5"
   local esl="${outbase}.esl" auth="${outbase}.auth"
   cert-to-efi-sig-list "$cert" "$esl"
   sign-efi-sig-list -k "$signer_key" -c "$signer_cert" "$signer_label" "$esl" "$auth"
-  log "Generado $auth"
+  log "Generado $auth a partir de $cert"
 }
 
 backup_if_exists() {
@@ -72,114 +69,150 @@ backup_if_exists() {
   fi
 }
 
-# safe sign: escribe a temp y mv para evitar corrupciones
 sbsign_replace() {
-  # args: <key> <cert> <input> <output>
-  local key="$1" cert="$2" infile="$3" outfile="$4"
-  local tmp
+  local key="$1" cert="$2" infile="$3" outfile="$4" tmp
   tmp="$(mktemp)"
   sbsign --key "$key" --cert "$cert" --output "$tmp" "$infile"
   mv -f "$tmp" "$outfile"
+  log "Firmado: $outfile"
 }
 
 # ---- Funciones principales ----
+firmar_todo() {
+  log "Iniciando proceso de firma..."
+  if ! [[ -f "$KEY_DIR/db.key" && -f "$KEY_DIR/db.crt" ]]; then
+    err "No se encontraron las claves de firma (db.key, db.crt) en $KEY_DIR."
+  fi
+  shopt -s nullglob
+  log "Buscando y firmando kernels en /boot..."
+  for k in /boot/vmlinuz-*; do
+    if [[ -f "$k" ]]; then
+      backup_if_exists "$k"
+      sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$k" "$k"
+    fi
+  done
+  shopt -u nullglob
+  if is_arch; then
+    log "Detectado Arch Linux. Usando shim-signed."
+    pacman -Sy --noconfirm --needed shim-signed >/dev/null || true
+    local SHIM_PATH="/usr/share/shim-signed/shimx64.efi"
+    local GRUB_PATH="/boot/efi/EFI/arch/grubx64.efi"
+    local MOK_MANAGER_PATH="/usr/share/shim-signed/mmx64.efi"
+    local BOOT_FALLBACK="/boot/efi/EFI/boot/bootx64.efi"
+    local GRUB_FALLBACK="/boot/efi/EFI/boot/grubx64.efi"
+    if [[ ! -f "$SHIM_PATH" ]]; then
+      err "No se encuentra shimx64.efi. Asegúrate de que 'shim-signed' esté instalado."
+    fi
+    mkdir -p "$(dirname "$BOOT_FALLBACK")"
+    cp -f "$SHIM_PATH" "$BOOT_FALLBACK"
+    cp -f "$MOK_MANAGER_PATH" "$(dirname "$BOOT_FALLBACK")/mmx64.efi"
+    backup_if_exists "$BOOT_FALLBACK"
+    sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$BOOT_FALLBACK" "$BOOT_FALLBACK"
+    if [[ -f "$GRUB_PATH" ]]; then
+      cp -f "$GRUB_PATH" "$GRUB_FALLBACK"
+      backup_if_exists "$GRUB_FALLBACK"
+      sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$GRUB_FALLBACK" "$GRUB_FALLBACK"
+    else
+      warn "No se encontró grubx64.efi en $GRUB_PATH. Esto es normal si usas systemd-boot."
+    fi
+  else
+    log "Firmando cargadores EFI detectados en $EFI_DIR..."
+    shopt -s nullglob
+    for efi in "$EFI_DIR"/EFI/*/*.efi "$EFI_DIR"/EFI/boot/bootx64.efi; do
+      if [[ -f "$efi" ]]; then
+        backup_if_exists "$efi"
+        sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$efi" "$efi"
+      fi
+    done
+    shopt -u nullglob
+  fi
+  log "Proceso de firma completado."
+}
+
+reinstalar_bootloader() {
+  log "Reinstalando gestor de arranque para registrar archivos firmados..."
+  if command -v bootctl &> /dev/null && [[ -d /sys/firmware/efi ]]; then
+    log "Detectado systemd-boot. Ejecutando 'bootctl install'..."
+    bootctl install
+  elif command -v grub-install &> /dev/null; then
+    log "Detectado GRUB. Ejecutando 'grub-install'..."
+    local BOOTLOADER_ID="GRUB"
+    if is_arch; then BOOTLOADER_ID="arch"; fi
+    grub-install --target=x86_64-efi --efi-directory="$EFI_DIR" --bootloader-id="$BOOTLOADER_ID" --removable
+  else
+    warn "No se pudo detectar 'bootctl' ni 'grub-install'. Deberás reinstalar tu gestor de arranque manualmente."
+  fi
+  log "Reinstalación del gestor de arranque finalizada."
+}
 
 generar_e_instalar_claves() {
   log "Generando e instalando claves en: $KEY_DIR"
-  pacman -Sy --noconfirm --needed efitools sbsigntools >/dev/null || true
+  pacman -Sy --noconfirm --needed efitools sbsigntools secureboot-db >/dev/null || true
+  mkdirp_root "$KEY_DIR"; chmod 700 "$KEY_DIR"; cd "$KEY_DIR" || exit 1
+  
+  # Generación de PK, KEK, DB
+  if [[ -f PK.key ]]; then log "PK ya existe. Omitiendo."; else
+    log "Generando PK..."; openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local PK/" -keyout PK.key -out PK.crt -days 3650 -nodes -sha256; cert-to-efi-sig-list PK.crt PK.esl; sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth; chmod 600 PK.*; fi
+  if [[ -f KEK.key ]]; then log "KEK ya existe. Omitiendo."; else
+    log "Generando KEK..."; openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local KEK/" -keyout KEK.key -out KEK.crt -days 3650 -nodes -sha256; cert-to-efi-sig-list KEK.crt KEK.esl; sign-efi-sig-list -k PK.key -c PK.crt KEK KEK.esl KEK.auth; chmod 600 KEK.*; fi
+  if [[ -f db.key ]]; then log "DB ya existe. Omitiendo."; else
+    log "Generando DB..."; openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local DB/" -keyout db.key -out db.crt -days 3650 -nodes -sha256; cert-to-efi-sig-list db.crt db.esl; sign-efi-sig-list -k KEK.key -c KEK.crt db db.esl db.auth; chmod 600 db.*; fi
 
-  mkdirp_root "$KEY_DIR"
-  chmod 700 "$KEY_DIR"
-
-  # Crear claves si no existen
-  cd "$KEY_DIR" || exit 1
-
-  # PK
-  if [[ -f PK.key && -f PK.crt && -f PK.auth ]]; then
-    log "PK ya existe. Omitiendo regeneración."
-  else
-    log "Generando PK (Platform Key)..."
-    openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local PK/" -keyout PK.key -out PK.crt -days 3650 -nodes -sha256
-    cert-to-efi-sig-list PK.crt PK.esl
-    sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
-    chmod 600 PK.key PK.crt PK.auth PK.esl
-  fi
-
-  # KEK
-  if [[ -f KEK.key && -f KEK.crt && -f KEK.auth ]]; then
-    log "KEK ya existe. Omitiendo regeneración."
-  else
-    log "Generando KEK (Key Exchange Key)..."
-    openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local KEK/" -keyout KEK.key -out KEK.crt -days 3650 -nodes -sha256
-    cert-to-efi-sig-list KEK.crt KEK.esl
-    # firmar KEK.esl con PK
-    sign-efi-sig-list -k PK.key -c PK.crt KEK KEK.esl KEK.auth
-    chmod 600 KEK.key KEK.crt KEK.auth KEK.esl
-  fi
-
-  # DB
-  if [[ -f db.key && -f db.crt && -f db.auth ]]; then
-    log "DB ya existe. Omitiendo regeneración."
-  else
-    log "Generando DB (Allowed Signatures)..."
-    openssl req -new -x509 -newkey rsa:4096 -subj "/CN=Local DB/" -keyout db.key -out db.crt -days 3650 -nodes -sha256
-    cert-to-efi-sig-list db.crt db.esl
-    # firmar db.esl con KEK
-    sign-efi-sig-list -k KEK.key -c KEK.crt db db.esl db.auth
-    chmod 600 db.key db.crt db.auth db.esl
-  fi
-
-  # Integración con claves Microsoft (append) si están disponibles
+  # Integración con claves Microsoft
   log "Buscando certificados de Microsoft para mantener compatibilidad..."
-  ms_cert="$(find_ms_cert || true)"
-  if [[ -n "$ms_cert" ]]; then
-    log "Encontrado certificado Microsoft: $ms_cert"
-    # KEK combined
-    create_and_sign_esl_auth "$ms_cert" "$KEY_DIR/MS_KEK_temp" "PK.key" "PK.crt" "KEK"
-    # Combine KEK.esl + MS KEK esl
-    cat KEK.esl "$KEY_DIR/MS_KEK_temp.esl" > KEK_combined.esl
+  ms_kek_cert_file=""
+  ms_db_cert_file=""
+  for dir in "${MS_KEYS_DIR_CANDIDATES[@]}"; do
+    if [[ -d "$dir" ]]; then
+      for name in "${MS_KEK_CRT_NAMES[@]}"; do
+        if [[ -f "$dir/$name" ]]; then ms_kek_cert_file="$dir/$name"; fi
+      done
+      for name in "${MS_DB_CRT_NAMES[@]}"; do
+        if [[ -f "$dir/$name" ]]; then ms_db_cert_file="$dir/$name"; fi
+      done
+    fi
+  done
+
+  if [[ -n "$ms_kek_cert_file" && -n "$ms_db_cert_file" ]]; then
+    log "Certificados Microsoft encontrados. Generando claves combinadas..."
+    
+    # Combinar KEK
+    create_and_sign_esl_auth "$ms_kek_cert_file" "MS_KEK_temp" "PK.key" "PK.crt" "KEK"
+    cat KEK.esl MS_KEK_temp.esl > KEK_combined.esl
     sign-efi-sig-list -k PK.key -c PK.crt KEK KEK_combined.esl KEK_combined.auth
-    log "KEK combinado creado: KEK_combined.auth"
-
-    # DB combined
-    create_and_sign_esl_auth "$ms_cert" "$KEY_DIR/MS_db_temp" "KEK.key" "KEK.crt" "db"
-    cat db.esl "$KEY_DIR/MS_db_temp.esl" > db_combined.esl
+    log "KEK combinado creado: KEK_combined.auth y KEK_combined.esl"
+    
+    # Combinar DB
+    create_and_sign_esl_auth "$ms_db_cert_file" "MS_db_temp" "KEK.key" "KEK.crt" "db"
+    cat db.esl MS_db_temp.esl > db_combined.esl
     sign-efi-sig-list -k KEK.key -c KEK.crt db db_combined.esl db_combined.auth
-    log "DB combinado creado: db_combined.auth"
-
-    log "NOTA: Para máxima compatibilidad, importa en BIOS: PK.auth (reemplaza), luego KEK_combined.auth (append), db_combined.auth (append)."
+    log "DB combinado creado: db_combined.auth y db_combined.esl"
   else
-    warn "No se encontraron certificados Microsoft en ubicaciones usuales. Si quieres compatibilidad con ISOs firmadas por Microsoft (Ubuntu/Fedora/etc.), instala el paquete con certificados MS o colócalos en /usr/share/efitools/keys y vuelve a ejecutar."
-    log "IMPORTANTE: Si decides usar MS keys más tarde, genera KEK/db combinados como se indica."
+    warn "No se encontraron los certificados de Microsoft después de la instalación. La compatibilidad puede ser limitada."
   fi
 
-  # Firmar cargadores EFI detectados en /boot/efi
-  log "Firmando cargadores EFI detectados en $EFI_DIR..."
-  shopt -s nullglob
-  for efi in "$EFI_DIR"/EFI/*/*.efi "$EFI_DIR"/EFI/boot/bootx64.efi; do
-    [[ -f "$efi" ]] || continue
-    # hacer backup
-    backup_if_exists "$efi"
-    log "Firmando: $efi"
-    sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$efi" "$efi"
-  done
-  shopt -u nullglob
-
-  log "Claves generadas y cargadores firmados (si fueron detectados)."
+  reinstalar_bootloader
+  firmar_todo
+  log "Claves generadas. Cargadores y kernels firmados."
   echo
-  echo "PASOS EN BIOS (Key Management):"
-  echo "  1) Importa PK.auth -> Reemplaza PK (solo una vez)."
+  echo "PASOS SIGUIENTES EN LA BIOS/UEFI (Key Management):"
+  echo "  1) Importa PK.auth -> REEMPLAZA la PK existente."
   if [[ -f "$KEY_DIR/KEK_combined.auth" ]]; then
-    echo "  2) Importa KEK_combined.auth -> Append (mantén la de Microsoft)."
+    echo "  2) Importa KEK_combined.auth -> AÑADE (Append) a las KEK."
+    echo "     (Si tu BIOS no soporta .auth para 'append', usa KEK_combined.esl)"
   else
-    echo "  2) Importa KEK.auth -> Append (si quieres mantener Microsoft, usa KEK_combined.auth si está disponible)."
+    echo "  2) Importa KEK.auth -> AÑADE (Append) a las KEK."
+    echo "     (Si tu BIOS no soporta .auth para 'append', usa KEK.esl)"
   fi
   if [[ -f "$KEY_DIR/db_combined.auth" ]]; then
-    echo "  3) Importa db_combined.auth -> Append (mantén Microsoft)."
+    echo "  3) Importa db_combined.auth -> AÑADE (Append) a la DB."
+    echo "     (Si tu BIOS no soporta .auth para 'append', usa db_combined.esl)"
   else
-    echo "  3) Importa db.auth -> Append (ten en cuenta compatibilidad)."
+    echo "  3) Importa db.auth -> AÑADE (Append) a la DB."
+    echo "     (Si tu BIOS no soporta .auth para 'append', usa db.esl)"
   fi
-  echo "  Deja dbx como viene de fábrica."
+  echo "  4) No modifiques 'dbx' (Forbidden Signatures)."
+  echo "  5) Activa Secure Boot y guarda los cambios."
 }
 
 crear_autofirma_y_hook() {
@@ -188,145 +221,128 @@ crear_autofirma_y_hook() {
 
   cat > "$SIGN_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
-# Script que firma kernels y initramfs (si aplica) con las claves en KEY_DIR.
-set -euo pipefail
+# Script que firma kernels y gestores de arranque con las claves en KEY_DIR.
+set -eu
 KEY_DIR="/usr/share/secureboot/keys"
-LOG="/var/log/secboot-sign-kernel.log"
-exec >>"$LOG" 2>&1
-# Firmar kernels en /boot (vmlinuz-*)
+LOG_FILE="/var/log/secboot-sign-kernel.log"
+# Redirigir stdout y stderr al archivo de log y a la consola
+exec > >(tee -a ${LOG_FILE}) 2>&1
+
+sbsign_replace() {
+  local key="$1" cert="$2" infile="$3" outfile="$4" tmp
+  tmp="$(mktemp)"
+  sbsign --key "$key" --cert "$cert" --output "$tmp" "$infile"
+  mv -f "$tmp" "$outfile"
+  echo "$(date -Iseconds) Signed: $outfile"
+}
+
+if [[ ! -f "$KEY_DIR/db.key" ]]; then
+    echo "$(date -Iseconds) ERROR: Clave de firma no encontrada en $KEY_DIR/db.key"
+    exit 1
+fi
+
+echo "--- Hook de Secure Boot ejecutado ---"
+# Firmar todos los kernels en /boot
 shopt -s nullglob
 for k in /boot/vmlinuz-*; do
-  if [[ ! -f "$k" ]]; then continue; fi
-  # Evitamos volver a firmar si ya está firmado (sbverify falla si no lo está).
   if sbverify --list "$k" >/dev/null 2>&1; then
-    echo "$(date -Iseconds) Skipping already signed kernel: $k"
-    continue
+    echo "Kernel ya firmado, omitiendo: $k"
+  else
+    sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$k" "$k"
   fi
-  tmp="$(mktemp)"
-  sbsign --key "$KEY_DIR/db.key" --cert "$KEY_DIR/db.crt" --output "$tmp" "$k"
-  mv -f "$tmp" "$k"
-  echo "$(date -Iseconds) Signed kernel: $k"
 done
 shopt -u nullglob
-# Intentar firmar grub efi en /boot/efi si existe
-EFI_BOOT="/boot/efi/EFI/boot/bootx64.efi"
-if [[ -f "$EFI_BOOT" ]]; then
-  if ! sbverify --list "$EFI_BOOT" >/dev/null 2>&1; then
-    tmp2="$(mktemp)"
-    sbsign --key "$KEY_DIR/db.key" --cert "$KEY_DIR/db.crt" --output "$tmp2" "$EFI_BOOT"
-    mv -f "$tmp2" "$EFI_BOOT"
-    echo "$(date -Iseconds) Signed EFI bootloader: $EFI_BOOT"
-  else
-    echo "$(date -Iseconds) EFI bootloader already signed: $EFI_BOOT"
-  fi
-fi
+
+# Re-firmar cargadores EFI
+EFI_CANDIDATES=(
+  "/boot/efi/EFI/boot/bootx64.efi"
+  "/boot/efi/EFI/boot/grubx64.efi"
+  "/boot/efi/EFI/arch/grubx64.efi"
+  "/boot/efi/EFI/systemd/systemd-bootx64.efi"
+)
+for efi_file in "${EFI_CANDIDATES[@]}"; do
+    if [[ -f "$efi_file" ]] && ! sbverify --list "$efi_file" >/dev/null 2>&1; then
+      sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$efi_file" "$efi_file"
+    fi
+done
+echo "--- Fin del hook de Secure Boot ---"
 EOF
 
   chmod 755 "$SIGN_SCRIPT"
   log "Script de firma creado."
 
-  log "Creando hook de pacman en: $PACMAN_HOOK_FILE"
+  log "Creando hook de pacman para yay/paru en: $PACMAN_HOOK_FILE"
   mkdir -p "$PACMAN_HOOK_DIR"
   cat > "$PACMAN_HOOK_FILE" <<EOF
 [Trigger]
 Operation = Install
 Operation = Upgrade
-Type = Path
-Target = boot/vmlinuz-*
+Type = Package
+# Vigila los paquetes de kernel más comunes y gestores de arranque
+Target = linux
+Target = linux-lts
+Target = linux-zen
+Target = linux-hardened
+Target = linux-lqx
+Target = grub
+Target = shim-signed
+Target = systemd
 
 [Action]
-Description = Firmando kernels con Secure Boot keys...
+Description = Firmando kernels/bootloaders con claves de Secure Boot...
 When = PostTransaction
 Exec = $SIGN_SCRIPT
 EOF
 
   chmod 644 "$PACMAN_HOOK_FILE"
   log "Hook de pacman creado."
-
-  # Verificar GRUB firmado
-  GRUB_CANDIDATES=("$EFI_DIR"/EFI/*/grubx64.efi "$EFI_DIR"/EFI/boot/bootx64.efi)
-  for g in "${GRUB_CANDIDATES[@]}"; do
-    [[ -f "$g" ]] || continue
-    if sbverify --list "$g" >/dev/null 2>&1; then
-      log "GRUB/boot EFI ya está firmado: $g"
-    else
-      log "Firmando GRUB/boot EFI: $g"
-      backup_if_exists "$g"
-      sbsign_replace "$KEY_DIR/db.key" "$KEY_DIR/db.crt" "$g" "$g"
-      log "Firmado: $g"
-    fi
-  done
-
-  log "Auto-firma y hook configurados."
-  log "Nota: El hook funciona en sistemas que usan pacman. Para otras distros, crea un hook equivalente (dnf/apt/etc.)."
+  log "Auto-firma y hook configurados para funcionar con pacman, yay y paru."
 }
 
 limpiar_generado() {
-  echo "ADVERTENCIA: Esto eliminará sólo los archivos generados por este script (claves en $KEY_DIR, hook y script). No modifica las claves cargadas en firmware."
+  echo "ADVERTENCIA: Esto eliminará los archivos generados por este script (claves, hook, script)."
   read -rp "¿Estás seguro y quieres continuar? (si/no): " confirm
-  if [[ "${confirm,,}" != "si" && "${confirm,,}" != "s" && "${confirm,,}" != "yes" ]]; then
-    echo "Abortado por usuario."
-    return 0
+  if [[ "${confirm,,}" != "si" && "${confirm,,}" != "s" ]]; then
+    echo "Abortado."; return 0
   fi
-
   log "Limpiando archivos generados..."
-  if [[ -d "$KEY_DIR" ]]; then
-    # Solo borrar si encontramos un archivo PK.key para evitar borrar cosas ajenas
-    if [[ -f "$KEY_DIR/PK.key" ]]; then
-      backup_if_exists "$KEY_DIR"
-      rm -rf "$KEY_DIR"
-      log "Eliminado directorio: $KEY_DIR"
-    else
-      warn "No se detectó PK.key en $KEY_DIR. No se eliminará el directorio por seguridad."
-    fi
-  fi
-
-  if [[ -f "$SIGN_SCRIPT" ]]; then
-    backup_if_exists "$SIGN_SCRIPT"
-    rm -f "$SIGN_SCRIPT"
-    log "Eliminado: $SIGN_SCRIPT"
-  fi
-
-  if [[ -f "$PACMAN_HOOK_FILE" ]]; then
-    backup_if_exists "$PACMAN_HOOK_FILE"
-    rm -f "$PACMAN_HOOK_FILE"
-    log "Eliminado hook: $PACMAN_HOOK_FILE"
-  fi
-
-  log "Limpieza completa. Si ya cargaste claves en la BIOS/UEFI, deberás borrarlas desde el menú Key Management del firmware si quieres volver al estado anterior."
+  if [[ -d "$KEY_DIR" && -f "$KEY_DIR/PK.key" ]]; then backup_if_exists "$KEY_DIR"; rm -rf "$KEY_DIR"; log "Eliminado directorio: $KEY_DIR"; else warn "No se eliminará $KEY_DIR por seguridad."; fi
+  [[ -f "$SIGN_SCRIPT" ]] && { backup_if_exists "$SIGN_SCRIPT"; rm -f "$SIGN_SCRIPT"; log "Eliminado: $SIGN_SCRIPT"; }
+  [[ -f "$PACMAN_HOOK_FILE" ]] && { backup_if_exists "$PACMAN_HOOK_FILE"; rm -f "$PACMAN_HOOK_FILE"; log "Eliminado hook: $PACMAN_HOOK_FILE"; }
+  log "Limpieza completa. Las claves en la BIOS/UEFI deben borrarse manualmente."
   log "Backups guardados en: ${BACKUP_DIR:-(no backups)}"
 }
 
 # ---- Menú ----
 ensure_root
-
 cat <<'EOF'
-===========================================
-   Secure Boot Manager - Menú principal
-===========================================
-1) Generar e instalar claves (PK, KEK, DB) y firmar cargadores EFI
-2) Crear script + hook para auto-firma de kernels y verificar/firmar GRUB
-3) Limpiar archivos generados por este script (claves, script, hook)
-0) Salir
+========================================================================
+           Secure Boot Manager - Asistente de configuración
+========================================================================
+ Este script te ayudará a tomar control de Secure Boot en tu sistema.
+
+ 1) Generar claves, firmar todo y reinstalar Bootloader
+    (Opción principal. Haz esto primero. Genera PK, KEK, db,
+     reinstala tu gestor de arranque y firma kernels y EFI.)
+
+ 2) Crear script y hook de auto-firma (Compatible con yay/paru)
+    (Crea un hook para `pacman` que firmará automáticamente los
+     nuevos kernels/bootloaders después de una actualización.)
+
+ 3) Limpiar archivos generados por este script
+    (Revierte los cambios en el disco duro, no en el firmware.)
+
+ 0) Salir
+========================================================================
 EOF
 
 read -rp "Elige una opción [0-3]: " opt
 case "$opt" in
-  1)
-    generar_e_instalar_claves
-    ;;
-  2)
-    crear_autofirma_y_hook
-    ;;
-  3)
-    limpiar_generado
-    ;;
-  0)
-    exit 0
-    ;;
-  *)
-    echo "Opción inválida"; exit 1
-    ;;
+  1) generar_e_instalar_claves ;;
+  2) crear_autofirma_y_hook ;;
+  3) limpiar_generado ;;
+  0) exit 0 ;;
+  *) echo "Opción inválida"; exit 1 ;;
 esac
 
 exit 0
