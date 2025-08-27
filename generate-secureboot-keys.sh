@@ -3,14 +3,27 @@
 set -euo pipefail
 
 KEY_DIR="/usr/share/secureboot/keys"
-EFI_DIR="/boot/EFI"
+EFI_MOUNTPOINT=""
 GUID_FILE="$KEY_DIR/GUID.txt"
 PACMAN_HOOK_DIR="/etc/pacman.d/hooks"
 HOOK_FILE="$PACMAN_HOOK_DIR/secureboot-sign.hook"
-BOOTLOADER_EFI="$EFI_DIR/BOOT/BOOTX64.EFI"
 
 echo "=== Instalando herramientas necesarias ==="
 sudo pacman -S --noconfirm efitools sbsigntools
+
+echo "=== Detectando punto de montaje EFI ==="
+for path in /boot/efi /boot/EFI; do
+    if [[ -d "$path" ]]; then
+        EFI_MOUNTPOINT="$path"
+        break
+    fi
+done
+
+if [[ -z "$EFI_MOUNTPOINT" ]]; then
+    echo "❌ No se encontró la partición EFI montada en /boot/efi ni /boot/EFI."
+    exit 1
+fi
+echo "✔️ Usando EFI en: $EFI_MOUNTPOINT"
 
 echo "=== Creando directorio para claves en: $KEY_DIR ==="
 sudo mkdir -p "$KEY_DIR"
@@ -41,15 +54,27 @@ openssl x509 -outform DER -in db.crt -out db.cer
 cert-to-efi-sig-list -g "$GUID" db.crt db.esl
 sign-efi-sig-list -g "$GUID" -k KEK.key -c KEK.crt db db.esl db.auth
 
-echo "=== Firmando gestor de arranque (BOOTX64.EFI) ==="
-if [[ -f "$BOOTLOADER_EFI" ]]; then
-    sudo sbsign --key db.key --cert db.crt --output "$BOOTLOADER_EFI" "$BOOTLOADER_EFI"
+echo "=== Buscando archivos EFI a firmar ==="
+mapfile -t EFI_FILES < <(find "$EFI_MOUNTPOINT" -type f -iname "*.efi" 2>/dev/null)
+
+if [[ ${#EFI_FILES[@]} -gt 0 ]]; then
+    for EFI_FILE in "${EFI_FILES[@]}"; do
+        # Evitar romper Windows Boot Manager
+        if [[ "$EFI_FILE" =~ bootmgfw\.efi$ ]]; then
+            echo "⚠️ Saltando Windows Boot Manager: $EFI_FILE"
+            continue
+        fi
+
+        echo "Firmando: $EFI_FILE"
+        sudo sbsign --key db.key --cert db.crt --output "$EFI_FILE" "$EFI_FILE"
+    done
 else
-    echo "❌ Archivo $BOOTLOADER_EFI no encontrado. Asegúrate de instalar systemd-boot primero."
+    echo "❌ No se encontró ningún archivo EFI en $EFI_MOUNTPOINT"
+    echo "Instala grub o systemd-boot primero."
 fi
 
 echo "=== Copiando claves a la partición EFI ==="
-sudo cp "$KEY_DIR"/*.cer "$KEY_DIR"/*.esl "$KEY_DIR"/*.auth "$EFI_DIR"
+sudo cp "$KEY_DIR"/*.cer "$KEY_DIR"/*.esl "$KEY_DIR"/*.auth "$EFI_MOUNTPOINT"
 
 echo "=== Creando hook de pacman para firmar kernel actualizado ==="
 sudo mkdir -p "$PACMAN_HOOK_DIR"
@@ -74,44 +99,59 @@ cat <<'EOF' | sudo tee /usr/local/bin/sign-kernel > /dev/null
 #!/bin/bash
 KEY="/usr/share/secureboot/keys/db.key"
 CERT="/usr/share/secureboot/keys/db.crt"
-KERNEL_PATH="/boot/vmlinuz-linux"
-SIGNED_KERNEL="/boot/vmlinuz-linux.signed"
+KERNELS=(/boot/vmlinuz-* /boot/efi/*/vmlinuz-* /boot/EFI/*/vmlinuz-*)
 
-if [ -f "$KERNEL_PATH" ]; then
-    /usr/bin/sbsign --key "$KEY" --cert "$CERT" --output "$SIGNED_KERNEL" "$KERNEL_PATH"
-    echo "Kernel firmado: $SIGNED_KERNEL ✔️"
-else
-    echo "⚠️ Kernel no encontrado en $KERNEL_PATH ⚠️"
-fi
+for KERNEL_PATH in "${KERNELS[@]}"; do
+    if [ -f "$KERNEL_PATH" ]; then
+        SIGNED_KERNEL="${KERNEL_PATH}.signed"
+        /usr/bin/sbsign --key "$KEY" --cert "$CERT" --output "$SIGNED_KERNEL" "$KERNEL_PATH"
+        echo "✔️ Kernel firmado: $SIGNED_KERNEL"
+    fi
+done
 EOF
 
 sudo chmod +x /usr/local/bin/sign-kernel
 
 echo "Hook y script de firmado instalados. ✅"
 
-echo "=== Configuración básica de Btrfs recomendada (manual) ==="
-cat <<'EOF'
+echo "=== Detectando sistema de archivos raíz ==="
+ROOT_FS=$(findmnt -n -o FSTYPE /)
 
-Puedes usar Btrfs con subvolúmenes para organizar mejor tu sistema:
+if [[ "$ROOT_FS" == "btrfs" ]]; then
+    echo "✔️ El sistema raíz usa Btrfs"
 
-Ejemplo de creación con subvolúmenes:
-  mkfs.btrfs -L archlinux /dev/sdX
-  mount /dev/sdX /mnt
-  btrfs subvolume create /mnt/@
-  btrfs subvolume create /mnt/@home
-  btrfs subvolume create /mnt/@log
-  btrfs subvolume create /mnt/@pkg
-  umount /mnt
+    ROOT_DEV=$(findmnt -n -o SOURCE /)
+    echo "Dispositivo raíz: $ROOT_DEV"
 
-Luego montar con:
-  mount -o subvol=@ /dev/sdX /mnt
-  mkdir -p /mnt/{home,var/log,var/cache/pacman/pkg}
-  mount -o subvol=@home /dev/sdX /mnt/home
-  mount -o subvol=@log /dev/sdX /mnt/var/log
-  mount -o subvol=@pkg /dev/sdX /mnt/var/cache/pacman/pkg
+    echo "=== Listando subvolúmenes existentes ==="
+    sudo btrfs subvolume list / || true
 
-Para usar snapshots con `snapper`, `btrfs-assistant` o `timeshift`.
+    echo "=== Detectando subvolúmenes estándar ==="
+    MISSING_SUBVOLS=()
+    for sub in @ @home @log @pkg; do
+        if ! sudo btrfs subvolume list / | grep -q "path $sub\$"; then
+            MISSING_SUBVOLS+=("$sub")
+        fi
+    done
 
-EOF
+    if [[ ${#MISSING_SUBVOLS[@]} -gt 0 ]]; then
+        echo "⚠️ Faltan los siguientes subvolúmenes: ${MISSING_SUBVOLS[*]}"
+        read -rp "¿Quieres que el script los cree automáticamente? [s/N] " ans
+        if [[ "$ans" =~ ^[sS]$ ]]; then
+            for sub in "${MISSING_SUBVOLS[@]}"; do
+                sudo btrfs subvolume create "/$sub"
+                echo "✔️ Subvolumen creado: /$sub"
+            done
+        else
+            echo "No se crearán subvolúmenes automáticamente."
+        fi
+    else
+        echo "✔️ Ya existen los subvolúmenes recomendados."
+    fi
+
+else
+    echo "⚠️ El sistema raíz no usa Btrfs (es $ROOT_FS)."
+    echo "Se omite configuración de subvolúmenes."
+fi
 
 echo "Todo listo. Reinicia y registra las claves desde la UEFI si no lo has hecho."
